@@ -20,6 +20,8 @@ from saml2 import BINDING_HTTP_REDIRECT
 from saml2 import BINDING_PAOS
 from saml2 import BINDING_SOAP
 from saml2 import BINDING_URI
+from saml2 import ecp
+from saml2 import element_to_extension_element
 from saml2 import server
 from saml2 import time_util
 from saml2.authn import is_equal
@@ -27,14 +29,20 @@ from saml2.authn_context import PASSWORD
 from saml2.authn_context import UNSPECIFIED
 from saml2.authn_context import AuthnBroker
 from saml2.authn_context import authn_context_class_ref
+from saml2.client import Saml2Client
+from saml2.client_base import MIME_PAOS
+from saml2.ecp_client import PAOS_HEADER_INFO
+from saml2.extension.pefim import SPCertEnc
 from saml2.httputil import BadRequest
 from saml2.httputil import NotFound
 from saml2.httputil import Redirect
 from saml2.httputil import Response
+from saml2.httputil import SeeOther
 from saml2.httputil import ServiceError
 from saml2.httputil import Unauthorized
 from saml2.httputil import get_post
 from saml2.httputil import geturl
+from saml2.httputil import parse_cookie
 from saml2.ident import Unknown
 from saml2.metadata import create_metadata_string
 from saml2.profile import ecp
@@ -43,8 +51,12 @@ from saml2.s_utils import UnknownPrincipal
 from saml2.s_utils import UnsupportedBinding
 from saml2.s_utils import exception_trace
 from saml2.s_utils import rndstr
+from saml2.s_utils import sid
+from saml2.saml import NAMEID_FORMAT_PERSISTENT
+from saml2.samlp import Extensions
 from saml2.sigver import encrypt_cert_from_item
 from saml2.sigver import verify_redirect_signature
+from saml2.sigver import SignatureError
 import saml2.xmldsig as ds
 
 
@@ -495,10 +507,321 @@ class SSO(Service):
         self.op_type = "ecp"
         return self.operation(_dict, BINDING_SOAP)
 
+# -----------------------------------------------------------------------------
+# === Reqester ====
+
+class ECPResponse:
+    code = 200
+    title = "OK"
+
+    def __init__(self, content):
+        self.content = content
+
+    # noinspection PyUnusedLocal
+    def __call__(self, environ, start_response):
+        start_response(f"{self.code} {self.title}", [("Content-Type", "text/xml")])
+        return [self.content]
+
+
+class SSOReq:
+    def __init__(
+        self,
+        sp,
+        environ,
+        start_response,
+        cache=None,
+        wayf=None,
+        discosrv=None,
+        bindings=None,
+    ):
+        self.sp = sp
+        self.environ = environ
+        self.start_response = start_response
+        self.cache = cache
+        self.idp_query_param = "IdpQuery"
+        self.wayf = wayf
+        self.discosrv = discosrv
+        if bindings:
+            self.bindings = bindings
+        else:
+            self.bindings = [
+                BINDING_HTTP_REDIRECT,
+                BINDING_HTTP_POST,
+                BINDING_HTTP_ARTIFACT,
+            ]
+        logger.debug("--- SSO ---")
+
+    def response(self, binding, http_args, do_not_start_response=False):
+        if binding == BINDING_HTTP_ARTIFACT:
+            resp = Redirect()
+        elif binding == BINDING_HTTP_REDIRECT:
+            for param, value in http_args["headers"]:
+                if param == "Location":
+                    resp = SeeOther(str(value))
+                    break
+            else:
+                resp = ServiceError("Parameter error")
+        else:
+            resp = Response(http_args["data"], headers=http_args["headers"])
+
+        if do_not_start_response:
+            return resp
+        else:
+            return resp(self.environ, self.start_response)
+
+    def _wayf_redirect(self, came_from):
+        sid_ = sid()
+        self.cache.outstanding_queries[sid_] = came_from
+        logger.debug("Redirect to WAYF function: %s", self.wayf)
+        return -1, SeeOther(headers=[("Location", f"{self.wayf}?{sid_}")])
+
+    def _pick_idp(self, came_from):
+        """
+        If more than one idp and if none is selected, I have to do wayf or
+        disco
+        """
+
+        _cli = self.sp
+
+        logger.debug("[_pick_idp] %s", self.environ)
+        if "HTTP_PAOS" in self.environ:
+            if self.environ["HTTP_PAOS"] == PAOS_HEADER_INFO:
+                if MIME_PAOS in self.environ["HTTP_ACCEPT"]:
+                    # Where should I redirect the user to
+                    # entityid -> the IdP to use
+                    # relay_state -> when back from authentication
+
+                    logger.debug("- ECP client detected -")
+
+                    _rstate = rndstr()
+                    self.cache.relay_state[_rstate] = geturl(self.environ)
+                    _entityid = _cli.config.ecp_endpoint(self.environ["REMOTE_ADDR"])
+
+                    if not _entityid:
+                        return -1, ServiceError("No IdP to talk to")
+                    logger.debug("IdP to talk to: %s", _entityid)
+                    return ecp.ecp_auth_request(_cli, _entityid, _rstate)
+                else:
+                    return -1, ServiceError("Faulty Accept header")
+            else:
+                return -1, ServiceError("unknown ECP version")
+
+        # Find all IdPs
+        idps = self.sp.metadata.with_descriptor("idpsso")
+
+        idp_entity_id = None
+
+        kaka = self.environ.get("HTTP_COOKIE", "")
+        if kaka:
+            try:
+                (idp_entity_id, _) = parse_cookie("ve_disco", "SEED_SAW", kaka)
+            except ValueError:
+                pass
+            except TypeError:
+                pass
+
+        # Any specific IdP specified in a query part
+        query = self.environ.get("QUERY_STRING")
+        if not idp_entity_id and query:
+            try:
+                _idp_entity_id = dict(parse_qs(query))[self.idp_query_param][0]
+                if _idp_entity_id in idps:
+                    idp_entity_id = _idp_entity_id
+            except KeyError:
+                logger.debug("No IdP entity ID in query: %s", query)
+
+        if not idp_entity_id:
+
+            if self.wayf:
+                if query:
+                    try:
+                        wayf_selected = dict(parse_qs(query))["wayf_selected"][0]
+                    except KeyError:
+                        return self._wayf_redirect(came_from)
+                    idp_entity_id = wayf_selected
+                else:
+                    return self._wayf_redirect(came_from)
+            elif self.discosrv:
+                if query:
+                    idp_entity_id = _cli.parse_discovery_service_response(query=self.environ.get("QUERY_STRING"))
+                if not idp_entity_id:
+                    sid_ = sid()
+                    self.cache.outstanding_queries[sid_] = came_from
+                    logger.debug("Redirect to Discovery Service function")
+                    eid = _cli.config.entityid
+                    ret = _cli.config.getattr("endpoints", "sp")["discovery_response"][0][0]
+                    ret += f"?sid={sid_}"
+                    loc = _cli.create_discovery_service_request(self.discosrv, eid, **{"return": ret})
+                    return -1, SeeOther(loc)
+            elif len(idps) == 1:
+                # idps is a dictionary
+                idp_entity_id = list(idps.keys())[0]
+            elif not len(idps):
+                return -1, ServiceError("Misconfiguration")
+            else:
+                return -1, NotImplementedError("No WAYF or DS present!")
+
+        logger.info("Chosen IdP: '%s'", idp_entity_id)
+        return 0, idp_entity_id
+
+    def redirect_to_auth(self, _cli, entity_id, came_from, sigalg=""):
+        try:
+            # Picks a binding to use for sending the Request to the IDP
+            _binding, destination = _cli.pick_binding(
+                "single_sign_on_service", self.bindings, "idpsso", entity_id=entity_id
+            )
+            logger.debug("binding: %s, destination: %s", _binding, destination)
+            # Binding here is the response binding that is which binding the
+            # IDP should use to return the response.
+            acs = _cli.config.getattr("endpoints", "sp")["assertion_consumer_service"]
+            # just pick one
+            endp, return_binding = acs[0]
+
+            extensions = None
+            cert = None
+            if _cli.config.generate_cert_func is not None:
+                cert_str, req_key_str = _cli.config.generate_cert_func()
+                cert = {"cert": cert_str, "key": req_key_str}
+                spcertenc = SPCertEnc(x509_data=ds.X509Data(x509_certificate=ds.X509Certificate(text=cert_str)))
+                extensions = Extensions(extension_elements=[element_to_extension_element(spcertenc)])
+
+            req_id, req = _cli.create_authn_request(
+                destination,
+                binding=return_binding,
+                extensions=extensions,
+                nameid_format=NAMEID_FORMAT_PERSISTENT,
+            )
+            _rstate = rndstr()
+            self.cache.relay_state[_rstate] = came_from
+            ht_args = _cli.apply_binding(_binding, f"{req}", destination, relay_state=_rstate, sigalg=sigalg)
+            _sid = req_id
+
+            if cert is not None:
+                self.cache.outstanding_certs[_sid] = cert
+
+        except Exception as exc:
+            logger.exception(exc)
+            resp = ServiceError(f"Failed to construct the AuthnRequest: {exc}")
+            return resp
+
+        # remember the request
+        self.cache.outstanding_queries[_sid] = came_from
+        return self.response(_binding, ht_args, do_not_start_response=True)
+
+    def do(self):
+        _cli = self.sp
+
+        # Which page was accessed to get here
+        came_from = geturl(self.environ)
+        logger.debug("[sp.challenge] RelayState >> '%s'", came_from)
+
+        # If more than one idp and if none is selected, I have to do wayf
+        (done, response) = self._pick_idp(came_from)
+        # Three cases: -1 something went wrong or Discovery service used
+        #               0 I've got an IdP to send a request to
+        #               >0 ECP in progress
+        logger.debug("_idp_pick returned: %s", done)
+        if done == -1:
+            return response(self.environ, self.start_response)
+        elif done > 0:
+            self.cache.outstanding_queries[done] = came_from
+            return ECPResponse(response)
+        else:
+            entity_id = response
+            # Do the AuthnRequest
+            resp = self.redirect_to_auth(_cli, entity_id, came_from)
+            return resp(self.environ, self.start_response)
+
+
+def finish_logout(environ, start_response):
+    logger.info("[logout done] environ: %s", environ)
+    logger.info("[logout done] remaining subjects: %s", CACHE.uid2user.values())
+
+    # remove cookie and stored info
+    cookie = CACHE.delete_cookie(environ)
+
+    resp = Response("You are now logged out of this service", headers=[cookie])
+    return resp(environ, start_response)
+
+
+class SLOReq(Service):
+    def __init__(self, sp, environ, start_response, cache=None):
+        Service.__init__(self, environ, start_response)
+        self.sp = sp
+        self.cache = cache
+
+    def do(self, message, binding, relay_state="", mtype="response"):
+        try:
+            txt = decode_base64_and_inflate(message)
+            is_logout_request = "LogoutRequest" in txt.split(">", 1)[0]
+        except:  # TODO: parse the XML correctly
+            is_logout_request = False
+
+        if is_logout_request:
+            self.sp.parse_logout_request(message, binding)
+        else:
+            self.sp.parse_logout_request_response(message, binding)
+
+        return finish_logout(self.environ, self.start_response)
+
+
+class CacheReq:
+    def __init__(self):
+        self.uid2user = {}
+        self.cookie_name = "spauthn"
+        self.outstanding_queries = {}
+        self.outstanding_certs = {}
+        self.relay_state = {}
+        self.user = {}
+        self.result = {}
+
+    def get_user(self, environ):
+        cookie = environ.get("HTTP_COOKIE", "")
+        logger.debug("Cookie: %s", cookie)
+        if cookie:
+            cookie_obj = SimpleCookie(cookie)
+            morsel = cookie_obj.get(self.cookie_name, None)
+            if morsel:
+                try:
+                    return self.uid2user[morsel.value]
+                except KeyError:
+                    return None
+            else:
+                logger.debug("No %s cookie", self.cookie_name)
+
+        return None
+
+    def delete_cookie(self, environ):
+        cookie = environ.get("HTTP_COOKIE", "")
+        logger.debug("delete cookie: %s", cookie)
+        if cookie:
+            _name = self.cookie_name
+            cookie_obj = SimpleCookie(cookie)
+            morsel = cookie_obj.get(_name, None)
+            cookie = SimpleCookie()
+            cookie[_name] = ""
+            cookie[_name]["path"] = "/"
+            logger.debug("Expire: %s", morsel)
+            cookie[_name]["expires"] = _expiration("now")
+            return cookie.output().split(": ", 1)
+        return None
+
+    def set_cookie(self, user):
+        uid = rndstr(32)
+        self.uid2user[uid] = user
+        cookie = SimpleCookie()
+        cookie[self.cookie_name] = uid
+        cookie[self.cookie_name]["path"] = "/"
+        cookie[self.cookie_name]["expires"] = _expiration(480)
+        logger.debug("Cookie expires: %s", cookie[self.cookie_name]["expires"])
+        return cookie.output().split(": ", 1)
+
+
 
 # -----------------------------------------------------------------------------
 # === Authentication ====
 # -----------------------------------------------------------------------------
+
 
 
 def do_authentication(environ, start_response, authn_context, key, redirect_uri, headers=None):
@@ -517,15 +840,20 @@ def do_authentication(environ, start_response, authn_context, key, redirect_uri,
         return resp(environ, start_response)
 
 
+def do_authentication(environ, start_response, authn_context, key, redirect_uri, headers=None):
+    """
+    Display the login form
+    """
+    logger.debug("Do authentication")
+    sso = SSOReq(SP, environ, start_response, cache=CACHE, **ARGS)
+    return sso.do()
+
+
 # -----------------------------------------------------------------------------
 
 
 PASSWD = {
-    "daev0001": "qwerty",
-    "testuser": "qwerty",
-    "roland": "dianakra",
-    "babs": "howes",
-    "upper": "crust",
+    "erik": "zztop",
 }
 
 
@@ -1066,8 +1394,11 @@ if __name__ == "__main__":
     parser.add_argument("-m", dest="mako_root", default="./")
     parser.add_argument(dest="config")
     args = parser.parse_args()
+    ARGS = {}
 
     CONFIG = importlib.import_module(args.config)
+
+    CACHE = CacheReq()
 
     AUTHN_BROKER = AuthnBroker()
     AUTHN_BROKER.add(authn_context_class_ref(PASSWORD), username_password_authn, 10, CONFIG.BASE)
@@ -1083,6 +1414,10 @@ if __name__ == "__main__":
         input_encoding="utf-8",
         output_encoding="utf-8",
     )
+
+    CNFBASE = args.config
+
+    SP = Saml2Client(config_file=f"{CNFBASE}")
 
     HOST = CONFIG.HOST
     PORT = CONFIG.PORT
