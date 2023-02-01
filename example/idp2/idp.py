@@ -1,5 +1,11 @@
 #!/usr/bin/env python
 import argparse
+
+try:
+    import html
+except:
+    import cgi as html
+
 import base64
 from hashlib import sha1
 from http.cookies import SimpleCookie
@@ -9,6 +15,7 @@ import os
 import re
 import time
 from urllib.parse import parse_qs
+import xml.dom.minidom
 
 from idp_user import EXTRA
 from idp_user import USERS
@@ -46,6 +53,8 @@ from saml2.httputil import parse_cookie
 from saml2.ident import Unknown
 from saml2.metadata import create_metadata_string
 from saml2.profile import ecp
+from saml2.response import StatusError
+from saml2.response import VerificationError
 from saml2.s_utils import PolicyError
 from saml2.s_utils import UnknownPrincipal
 from saml2.s_utils import UnsupportedBinding
@@ -69,7 +78,7 @@ except ImportError:
 
 
 logger = logging.getLogger("saml2.idp")
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.DEBUG)
 
 
 class Cache:
@@ -107,6 +116,7 @@ def dict2list_of_tuples(d):
 class Service:
     def __init__(self, environ, start_response, user=None):
         self.environ = environ
+        assert hasattr(environ, "get")
         logger.debug("ENVIRON: %s", environ)
         self.start_response = start_response
         self.user = user
@@ -146,7 +156,7 @@ class Service:
 
     def operation(self, saml_msg, binding):
         logger.debug("_operation: %s", saml_msg)
-        if not (saml_msg and "SAMLRequest" in saml_msg):
+        if not saml_msg:
             resp = BadRequest("Error parsing request or no request")
             return resp(self.environ, self.start_response)
         else:
@@ -162,6 +172,14 @@ class Service:
                     return resp(self.environ, self.start_response)
             else:
                 kwargs = {}
+
+            try:
+                _relay_state = saml_msg["RelayState"]
+            except KeyError:
+                _relay_state = ""
+
+            if "SAMLResponse" in saml_msg:
+                return self.do(saml_msg["SAMLResponse"], binding, _relay_state, mtype="response")
 
             try:
                 kwargs["encrypt_cert"] = encrypt_cert_from_item(saml_msg["req_info"].message)
@@ -187,16 +205,16 @@ class Service:
             except KeyError:
                 return self.do(request, BINDING_HTTP_ARTIFACT)
 
-    def response(self, binding, http_args):
+    def response(self, binding, http_args, headers=[]):
         resp = None
         if binding == BINDING_HTTP_ARTIFACT:
-            resp = Redirect()
+            resp = Redirect(headers=headers)
         elif http_args["data"]:
-            resp = Response(http_args["data"], headers=http_args["headers"])
+            resp = Response(http_args["data"], headers=http_args["headers"]+headers)
         else:
             for header in http_args["headers"]:
                 if header[0] == "Location":
-                    resp = Redirect(header[1])
+                    resp = Redirect(header[1], headers=headers)
 
         if not resp:
             resp = ServiceError("Don't know how to return response")
@@ -244,6 +262,7 @@ class Service:
         kaka = delete_cookie(self.environ, "idpauthn")
         if kaka:
             kwargs["headers"] = [kaka]
+        logger.warning("not_authn")
         return do_authentication(self.environ, self.start_response, **kwargs)
 
 
@@ -423,6 +442,7 @@ class SSO(Service):
                     return resp(self.environ, self.start_response)
 
             if self.user:
+                logger.warning("not_authn 2")
                 saml_msg["req_info"] = self.req_info
                 if _req.force_authn is not None and _req.force_authn.lower() == "true":
                     key = self._store_request(saml_msg)
@@ -430,6 +450,7 @@ class SSO(Service):
                 else:
                     return self.operation(saml_msg, BINDING_HTTP_REDIRECT)
             else:
+                logger.warning("not_authn 3")
                 saml_msg["req_info"] = self.req_info
                 key = self._store_request(saml_msg)
                 return self.not_authn(key, _req.requested_authn_context)
@@ -453,12 +474,14 @@ class SSO(Service):
             _req = self.req_info.message
             if self.user:
                 if _req.force_authn is not None and _req.force_authn.lower() == "true":
+                    logger.warning("not_authn 4")
                     saml_msg["req_info"] = self.req_info
                     key = self._store_request(saml_msg)
                     return self.not_authn(key, _req.requested_authn_context)
                 else:
                     return self.operation(saml_msg, BINDING_HTTP_POST)
             else:
+                logger.warning("not_authn 5")
                 saml_msg["req_info"] = self.req_info
                 key = self._store_request(saml_msg)
                 return self.not_authn(key, _req.requested_authn_context)
@@ -514,12 +537,13 @@ class ECPResponse:
     code = 200
     title = "OK"
 
-    def __init__(self, content):
+    def __init__(self, content, headers):
         self.content = content
+        self.headers = headers if headers else []
 
     # noinspection PyUnusedLocal
     def __call__(self, environ, start_response):
-        start_response(f"{self.code} {self.title}", [("Content-Type", "text/xml")])
+        start_response(f"{self.code} {self.title}", [("Content-Type", "text/xml")] + self.headers)
         return [self.content]
 
 
@@ -531,6 +555,7 @@ class SSOReq:
         start_response,
         cache=None,
         wayf=None,
+        cookie=None,
         discosrv=None,
         bindings=None,
     ):
@@ -539,6 +564,7 @@ class SSOReq:
         self.start_response = start_response
         self.cache = cache
         self.idp_query_param = "IdpQuery"
+        self.extra_headers = [cookie] if cookie else []
         self.wayf = wayf
         self.discosrv = discosrv
         if bindings:
@@ -553,27 +579,27 @@ class SSOReq:
 
     def response(self, binding, http_args, do_not_start_response=False):
         if binding == BINDING_HTTP_ARTIFACT:
-            resp = Redirect()
+            resp = Redirect(headers=self.extra_headers)
         elif binding == BINDING_HTTP_REDIRECT:
             for param, value in http_args["headers"]:
                 if param == "Location":
-                    resp = SeeOther(str(value))
+                    resp = SeeOther(str(value), headers=self.extra_headers)
                     break
             else:
                 resp = ServiceError("Parameter error")
         else:
-            resp = Response(http_args["data"], headers=http_args["headers"])
+            resp = Response(http_args["data"], headers=http_args["headers"] + self.extra_headers)
 
         if do_not_start_response:
             return resp
         else:
-            return resp(self.environ, self.start_response)
+            return resp(self.environ, self.start_response, headers=self.extra_headers)
 
     def _wayf_redirect(self, came_from):
         sid_ = sid()
         self.cache.outstanding_queries[sid_] = came_from
         logger.debug("Redirect to WAYF function: %s", self.wayf)
-        return -1, SeeOther(headers=[("Location", f"{self.wayf}?{sid_}")])
+        return -1, SeeOther(headers=[("Location", f"{self.wayf}?{sid_}")]+self.extra_headers)
 
     def _pick_idp(self, came_from):
         """
@@ -722,15 +748,54 @@ class SSOReq:
         #               >0 ECP in progress
         logger.debug("_idp_pick returned: %s", done)
         if done == -1:
-            return response(self.environ, self.start_response)
+            return response(self.environ, self.start_response, headers=self.extra_headers)
         elif done > 0:
             self.cache.outstanding_queries[done] = came_from
-            return ECPResponse(response)
+            return ECPResponse(response, self.extra_headers)
         else:
             entity_id = response
             # Do the AuthnRequest
             resp = self.redirect_to_auth(_cli, entity_id, came_from)
-            return resp(self.environ, self.start_response)
+            return resp(self.environ, self.start_response, headers=self.extra_headers)
+
+
+# noinspection PyUnusedLocal
+def logout(environ, start_response, user):
+    sp = SP
+
+    if user is None:
+        sso = SSOReq(sp, environ, start_response, cache=CACHE, **ARGS)
+        return sso.do()
+
+    logger.info("[logout] subject_id: '%s'", user.name_id)
+
+    # What if more than one
+    data = sp.global_logout(user.name_id)
+    logger.info("[logout] global_logout > %s", data)
+
+    for entity_id, logout_info in data.items():
+        if isinstance(logout_info, tuple):
+            binding, http_info = logout_info
+
+            if binding == BINDING_HTTP_POST:
+                body = "".join(http_info["data"])
+                resp = Response(body)
+                return resp(environ, start_response)
+            elif binding == BINDING_HTTP_REDIRECT:
+                for key, value in http_info["headers"]:
+                    if key.lower() == "location":
+                        resp = Redirect(value)
+                        return resp(environ, start_response)
+
+                resp = ServiceError("missing Location header")
+                return resp(environ, start_response)
+            else:
+                resp = ServiceError("unknown logout binding: %s", binding)
+                return resp(environ, start_response)
+        else:  # result from logout, should be OK
+            pass
+
+    return finish_logout(environ, start_response)
 
 
 def finish_logout(environ, start_response):
@@ -745,9 +810,9 @@ def finish_logout(environ, start_response):
 
 
 class SLOReq(Service):
-    def __init__(self, sp, environ, start_response, cache=None):
+    def __init__(self, environ, start_response, cache=None):
         Service.__init__(self, environ, start_response)
-        self.sp = sp
+        self.sp = SP
         self.cache = cache
 
     def do(self, message, binding, relay_state="", mtype="response"):
@@ -776,16 +841,22 @@ class CacheReq:
         self.result = {}
 
     def get_user(self, environ):
+        uid = self.get_uid(environ)
+        if uid:
+            try:
+                return self.uid2user[uid]
+            except KeyError:
+                return None
+        return None
+
+    def get_uid(self, environ):
         cookie = environ.get("HTTP_COOKIE", "")
         logger.debug("Cookie: %s", cookie)
         if cookie:
             cookie_obj = SimpleCookie(cookie)
             morsel = cookie_obj.get(self.cookie_name, None)
             if morsel:
-                try:
-                    return self.uid2user[morsel.value]
-                except KeyError:
-                    return None
+                return morsel.value
             else:
                 logger.debug("No %s cookie", self.cookie_name)
 
@@ -816,6 +887,126 @@ class CacheReq:
         logger.debug("Cookie expires: %s", cookie[self.cookie_name]["expires"])
         return cookie.output().split(": ", 1)
 
+    def set_proxid(self):
+        uid = rndstr(32)
+        cookie = SimpleCookie()
+        cookie["proxid"] = uid
+        cookie["proxid"]["path"] = "/"
+        cookie["proxid"]["expires"] = _expiration(480)
+        return uid, cookie.output().split(": ", 1)
+ 
+    def get_proxid(self, environ):
+        cookie = environ.get("HTTP_COOKIE", "")
+        logger.debug("Cookie: %s", cookie)
+        if cookie:
+            cookie_obj = SimpleCookie(cookie)
+            morsel = cookie_obj.get("proxid", None)
+            if morsel:
+                return morsel.value
+        return None
+
+
+
+
+# -----------------------------------------------------------------------------
+#  Attribute Consuming service
+# -----------------------------------------------------------------------------
+
+
+class User:
+    def __init__(self, name_id, data, saml_response):
+        self.name_id = name_id
+        self.data = data
+        self.response = saml_response
+
+    def __str__(self):
+        return "USEROBJ<" + str(self.name_id) + ">"
+
+    @property
+    def authn_statement(self):
+        xml_doc = xml.dom.minidom.parseString(str(self.response.assertion.authn_statement[0]))
+        return xml_doc.toprettyxml()
+
+
+class ACS(Service):
+    def __init__(self, environ, start_response, cache=None, **kwargs):
+        Service.__init__(self, environ, start_response)
+        self.sp = SP
+        self.cache = cache or CACHE
+        self.outstanding_queries = self.cache.outstanding_queries
+        self.response = None
+        self.kwargs = kwargs
+
+    def do(self, response, binding, relay_state="", mtype="response"):
+        """
+        :param response: The SAML response, transport encoded
+        :param binding: Which binding the query came in over
+        """
+        # tmp_outstanding_queries = dict(self.outstanding_queries)
+        if not response:
+            logger.info("Missing Response")
+            resp = Unauthorized("Unknown user")
+            return resp(self.environ, self.start_response)
+
+        try:
+            conv_info = {
+                "remote_addr": self.environ["REMOTE_ADDR"],
+                "request_uri": self.environ["REQUEST_URI"],
+                "entity_id": self.sp.config.entityid,
+                "endpoints": self.sp.config.getattr("endpoints", "sp"),
+            }
+
+            self.response = self.sp.parse_authn_request_response(
+                response,
+                binding,
+                self.outstanding_queries,
+                self.cache.outstanding_certs,
+                conv_info=conv_info,
+            )
+        except UnknownPrincipal as excp:
+            logger.error("UnknownPrincipal: %s", excp)
+            resp = ServiceError(f"UnknownPrincipal: {excp}")
+            return resp(self.environ, self.start_response)
+        except UnsupportedBinding as excp:
+            logger.error("UnsupportedBinding: %s", excp)
+            resp = ServiceError(f"UnsupportedBinding: {excp}")
+            return resp(self.environ, self.start_response)
+        except VerificationError as err:
+            resp = ServiceError(f"Verification error: {err}")
+            return resp(self.environ, self.start_response)
+        except SignatureError as err:
+            resp = ServiceError(f"Signature error: {err}")
+            return resp(self.environ, self.start_response)
+        except Exception as err:
+            resp = ServiceError(f"Other error: {err}")
+            return resp(self.environ, self.start_response)
+
+        logger.info("AVA: %s", self.response.ava)
+
+        user = User(self.response.name_id, self.response.ava, self.response)
+        cookie = self.cache.set_cookie(user)
+
+        resp = Redirect("/", headers=[cookie])
+        return resp(self.environ, self.start_response)
+
+    def verify_attributes(self, ava):
+        logger.info("SP: %s", self.sp.config.entityid)
+        rest = POLICY.get_entity_categories(self.sp.config.entityid, self.sp.metadata)
+
+        akeys = [k.lower() for k in ava.keys()]
+
+        res = {"less": [], "more": []}
+        for key, attr in rest.items():
+            if key not in ava:
+                if key not in akeys:
+                    res["less"].append(key)
+
+        for key, attr in ava.items():
+            _key = key.lower()
+            if _key not in rest:
+                res["more"].append(key)
+
+        return res
 
 
 # -----------------------------------------------------------------------------
@@ -840,12 +1031,27 @@ def do_authentication(environ, start_response, authn_context, key, redirect_uri,
         return resp(environ, start_response)
 
 
+PROXCACHE = {}
+
 def do_authentication(environ, start_response, authn_context, key, redirect_uri, headers=None):
     """
     Display the login form
     """
-    logger.debug("Do authentication")
-    sso = SSOReq(SP, environ, start_response, cache=CACHE, **ARGS)
+    logger.info("pick %s", authn_context)
+    auth_info = AUTHN_BROKER.pick(authn_context)
+    if auth_info:
+        _, reference = auth_info[0]
+    else:
+        reference = 1
+    logger.info("start prox auth: key=%s, redir=%s, env=%s", key, redirect_uri, environ)
+    query_str = get_post(environ)
+    if not isinstance(query_str, str):
+        query_str = query_str.decode("ascii")
+    query = parse_qs(query_str)
+    uid, kaka = CACHE.set_proxid()
+    PROXCACHE[uid] = (query, key, redirect_uri, environ, reference)
+    logger.debug("Do authentication: proxid is %s", uid)
+    sso = SSOReq(SP, environ, start_response, cache=CACHE, cookie=kaka, **ARGS)
     return sso.do()
 
 
@@ -1220,6 +1426,42 @@ def set_cookie(name, _, *args):
     return tuple(cookie.output().split(": ", 1))
 
 
+def main(environ, start_response, user):
+    user = CACHE.get_user(environ)
+    proxid = CACHE.get_proxid(environ)
+
+    sp = SP
+
+    if user is None:
+        sso = SSOReq(sp, environ, start_response, cache=CACHE, **ARGS)
+        return sso.do()
+
+    found = PROXCACHE.get(proxid)
+
+    if not found:
+        resp = Response("PROXCACHE ongoing request not found")
+        return resp(environ, start_response)
+
+    query, key, redirect_uri, environ, reference = found
+
+    query = query or environ.get("QUERY_STRING")
+
+    user = user.name_id.text
+    uid = rndstr(24)
+    IDP.cache.uid2user[uid] = user
+    IDP.cache.user2uid[user] = uid
+    logger.debug("Register %s under '%s'", user, uid)
+
+    kaka = set_cookie("idpauthn", "/", uid, reference)
+
+    lox = f"{redirect_uri}?id={uid}&key={key}"
+    logger.debug("Redirect => %s", lox)
+    resp = Redirect(lox, headers=[kaka], content="text/html")
+    return resp(environ, start_response, authn_reference=reference)
+
+    # return self.operation(saml_msg, BINDING_HTTP_REDIRECT)
+
+
 # ----------------------------------------------------------------------------
 
 
@@ -1257,6 +1499,7 @@ AUTHN_URLS = [
     #
     (r"aqs$", (AQS, "soap")),
     (r"attr$", (ATTR, "soap")),
+    (r"^$", main),
 ]
 
 NON_AUTHN_URLS = [
@@ -1264,6 +1507,21 @@ NON_AUTHN_URLS = [
     (r"verify?(.*)$", do_verify),
     (r"sso/ecp$", (SSO, "ecp")),
 ]
+
+
+SP_URLS = [
+      # Hmm, place holder, NOT used
+      (r"^logout$", logout),
+]
+
+
+def add_urls():
+      base = "acs"
+
+      SP_URLS.append((f"{base}/post$", (ACS, "post", SP)))
+      SP_URLS.append((f"{base}/post/(.*)$", (ACS, "post", SP)))
+      SP_URLS.append((f"{base}/redirect$", (ACS, "redirect", SP)))
+      SP_URLS.append((f"{base}/redirect/(.*)$", (ACS, "redirect", SP)))
 
 
 # ----------------------------------------------------------------------------
@@ -1354,6 +1612,8 @@ def application(environ, start_response):
         # insert NON_AUTHN_URLS first in case there is no user
         url_patterns = NON_AUTHN_URLS + url_patterns
 
+    url_patterns += SP_URLS
+
     for regex, callback in url_patterns:
         match = re.search(regex, path)
         if match is not None:
@@ -1364,6 +1624,7 @@ def application(environ, start_response):
 
             logger.debug("Callback: %s", callback)
             if isinstance(callback, tuple):
+                assert(hasattr, environ, "get")
                 cls = callback[0](environ, start_response, user)
                 func = getattr(cls, callback[1])
 
@@ -1373,6 +1634,45 @@ def application(environ, start_response):
     if re.search(r"static/.*", path) is not None:
         return staticfile(environ, start_response)
     return not_found(environ, start_response)
+
+
+def _html_escape(payload):
+    return html.escape(payload, quote=True)
+
+
+def dict_to_table(ava, lev=0, width=1):
+    txt = [f'<table border={width} bordercolor="black">\n']
+    for prop, valarr in ava.items():
+        txt.append("<tr>\n")
+        if isinstance(valarr, str):
+            txt.append(f"<th>{str(prop)}</th>\n")
+            txt.append(f"<td>{valarr}</td>\n")
+        elif isinstance(valarr, list):
+            i = 0
+            n = len(valarr)
+            for val in valarr:
+                if not i:
+                    txt.append(f"<th rowspan={len(valarr)}>{prop}</td>\n")
+                else:
+                    txt.append("<tr>\n")
+                if isinstance(val, dict):
+                    txt.append("<td>\n")
+                    txt.extend(dict_to_table(val, lev + 1, width - 1))
+                    txt.append("</td>\n")
+                else:
+                    txt.append(f"<td>{val}</td>\n")
+                if n > 1:
+                    txt.append("</tr>\n")
+                n -= 1
+                i += 1
+        elif isinstance(valarr, dict):
+            txt.append(f"<th>{prop}</th>\n")
+            txt.append("<td>\n")
+            txt.extend(dict_to_table(valarr, lev + 1, width - 1))
+            txt.append("</td>\n")
+        txt.append("</tr>\n")
+    txt.append("</table>\n")
+    return txt
 
 
 # ----------------------------------------------------------------------------
@@ -1419,8 +1719,12 @@ if __name__ == "__main__":
 
     SP = Saml2Client(config_file=f"{CNFBASE}")
 
+    add_urls()
+
     HOST = CONFIG.HOST
     PORT = CONFIG.PORT
+
+    POLICY = CONFIG.POLICY
 
     sign_alg = None
     digest_alg = None

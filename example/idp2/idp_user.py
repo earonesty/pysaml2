@@ -35,7 +35,7 @@
 # USERS = LDAPDict(**ldap_settings)
 
 USERS = {
-    "erik": {
+    "erik@q32.com": {
         "last_name": "Aronesty",
         "first_name": "Erik",
         "User:Email": "erik@q32.com",

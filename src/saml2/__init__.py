@@ -673,6 +673,9 @@ class SamlBase(ExtensionContainer):
             x = x.decode("utf-8")
         return x
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}[{self.__str__()}]]"
+
     def keyswv(self):
         """Return the keys of attributes or children that has values
 
