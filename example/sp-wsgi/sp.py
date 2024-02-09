@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import argparse
+import defusedxml.minidom
 
 
 try:
@@ -15,7 +16,6 @@ import os
 import re
 import sys
 from urllib.parse import parse_qs
-import xml.dom.minidom
 
 from saml2 import BINDING_HTTP_ARTIFACT
 from saml2 import BINDING_HTTP_POST
@@ -338,7 +338,7 @@ class User:
 
     @property
     def authn_statement(self):
-        xml_doc = xml.dom.minidom.parseString(str(self.response.assertion.authn_statement[0]))
+        xml_doc = defusedxml.minidom.parseString(str(self.response.assertion.authn_statement[0]))
         return xml_doc.toprettyxml()
 
 
