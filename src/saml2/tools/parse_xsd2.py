@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import types
+import defusedxml.ElementTree
 
 
 __version__ = 0.5
@@ -1998,7 +1999,7 @@ def parse_nsmap(fil):
     root = None
     ns_map = []
 
-    for event, elem in ElementTree.iterparse(fil, events):
+    for event, elem in defusedxml.ElementTree.iterparse(fil, events):
         if event == "start-ns":
             ns_map.append(elem)
         elif event == "end-ns":
